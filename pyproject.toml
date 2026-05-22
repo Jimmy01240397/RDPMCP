@@ -1,0 +1,22 @@
+[project]
+name = "rdp-mcp"
+version = "0.1.0"
+description = "MCP server exposing RDP sessions as tools (connect / snapshot / mouse / keyboard)."
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.2.0",
+    "aardwolf>=0.2.13",
+    "asysocks>=0.2.12",
+    "asyauth>=0.0.21",
+    "pillow>=10.0.0",
+]
+
+[project.scripts]
+rdp-mcp = "server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["server", "manager"]
