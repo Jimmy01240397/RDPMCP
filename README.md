@@ -17,28 +17,67 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## Run (stdio)
+## Run
+
+Two transports:
 
 ```powershell
-.\.venv\Scripts\python.exe server.py
+.\.venv\Scripts\python.exe server.py                  # stdio (default)
+.\.venv\Scripts\python.exe server.py --http           # 127.0.0.1:8765
+.\.venv\Scripts\python.exe server.py --http 0.0.0.0:9000
 ```
+
+## Per-agent isolation
+
+The HTTP transport partitions every session pool by the caller's
+`Authorization: Bearer <token>` header. Two different agents never see
+each other's sessions, even when both connect to the same target host.
+Missing/empty bearer is accepted and mapped to the literal agent name
+`anonymous` (every header-less request shares one pool).
+
+| Bearer header                       | Agent identity     |
+|-------------------------------------|--------------------|
+| `Authorization: Bearer alice-key`   | `alice-key`        |
+| `Authorization: Bearer bob-key`     | `bob-key`          |
+| (none) / `Bearer ` (empty)          | `anonymous`        |
+| `Basic xxx` (other scheme)          | `anonymous`        |
+
+In **stdio** mode there is no per-request header, so every call maps to
+the single `anonymous` agent — useful for single-user dev work.
 
 ## Register with Claude Code
 
-Add to `~/.claude/settings.json` (adjust path):
-
-```json
-{
-  "mcpServers": {
-    "rdp": {
-      "command": "z:\\CTF\\pwn2own\\berlin2026\\rds\\rdp_mcp\\.venv\\Scripts\\python.exe",
-      "args": ["z:\\CTF\\pwn2own\\berlin2026\\rds\\rdp_mcp\\server.py"]
-    }
-  }
-}
+**stdio** (single agent, simplest):
+```powershell
+claude mcp add rdp -- "z:\CTF\pwn2own\berlin2026\rds\rdp_mcp\.venv\Scripts\python.exe" `
+                     "z:\CTF\pwn2own\berlin2026\rds\rdp_mcp\server.py"
 ```
 
-Or in Claude Desktop's `claude_desktop_config.json` with the same shape.
+**HTTP with per-agent bearer** (multiple Claude instances / sub-agents):
+
+1. Start the server once:
+   ```powershell
+   .\.venv\Scripts\python.exe server.py --http
+   ```
+2. Each agent registers with its own bearer:
+   ```powershell
+   claude mcp add --transport http rdp http://127.0.0.1:8765/mcp `
+       --header "Authorization: Bearer alice-key"
+   ```
+   or by hand in `~/.claude/settings.json`:
+   ```json
+   {
+     "mcpServers": {
+       "rdp": {
+         "type": "http",
+         "url": "http://127.0.0.1:8765/mcp",
+         "headers": { "Authorization": "Bearer alice-key" }
+       }
+     }
+   }
+   ```
+   A second agent uses a different token (`bob-key`, etc.); the server
+   keeps their session pools entirely separate.
 
 ## Tools
 
@@ -103,6 +142,10 @@ await switch(b); await disconnect()  # closes B, A becomes active
 
 ## Files
 
-- `server.py` — FastMCP entry point, defines the 8 tools.
-- `manager.py` — `SessionManager`: aardwolf wiring, frame buffer, input.
+- `server.py` — FastMCP entry point + BearerMiddleware + transport CLI.
+- `manager.py` — `SessionManager` partitioned by bearer (`AgentState`
+  per agent); aardwolf wiring, frame buffer, mouse / keyboard.
+- `test_connect.py` — single-agent end-to-end smoke (needs `.185`).
+- `test_multi_agent.py` — 8 offline unit tests covering agent isolation
+  and the BearerMiddleware extraction (no network).
 - `pyproject.toml` / `requirements.txt` — deps.

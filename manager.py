@@ -1,8 +1,10 @@
-"""RDP session manager backed by aardwolf.
+"""RDP session manager backed by aardwolf, partitioned by agent bearer.
 
-Multiple sessions are tracked but only the *active* one is the implicit
-target of every input/output call. Use `switch(session_id)` to change
-the active session; `connect` returns a new id and makes it active.
+Each bearer (an opaque string sent by the calling agent, defaulting to
+``"anonymous"``) owns its own ``AgentState`` containing an independent
+session pool and active session pointer.  Agent A cannot enumerate or
+operate on Agent B's sessions; two agents may freely open separate RDP
+connections to the same target host.
 """
 
 from __future__ import annotations
@@ -11,7 +13,7 @@ import asyncio
 import io
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import quote
 
@@ -64,7 +66,6 @@ _SCANCODES: dict[str, int] = {
 
 
 def _resolve_key(name: str) -> tuple[int, bool]:
-    """Return (scancode, is_extended) for a friendly key name."""
     raw = _SCANCODES.get(name.lower())
     if raw is None:
         raise ValueError(f"Unknown key: {name!r}")
@@ -76,6 +77,9 @@ def _resolve_key(name: str) -> tuple[int, bool]:
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
+
+ANONYMOUS = "anonymous"
+
 
 @dataclass
 class ConnectionParams:
@@ -99,25 +103,57 @@ class RDPSession:
     connected_at: float = 0.0
 
 
+@dataclass
+class AgentState:
+    bearer: str
+    sessions: dict[str, RDPSession] = field(default_factory=dict)
+    active_id: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
-# Session manager
+# Session manager — agent-partitioned
 # ---------------------------------------------------------------------------
 
 class SessionManager:
     def __init__(self) -> None:
-        self.sessions: dict[str, RDPSession] = {}
-        self.active_id: Optional[str] = None
+        self.agents: dict[str, AgentState] = {}
+
+    # -- agent partitioning -------------------------------------------------
+
+    def _agent(self, bearer: Optional[str]) -> AgentState:
+        key = bearer or ANONYMOUS
+        st = self.agents.get(key)
+        if st is None:
+            st = AgentState(bearer=key)
+            self.agents[key] = st
+        return st
+
+    def _active(self, bearer: Optional[str]) -> RDPSession:
+        agent = self._agent(bearer)
+        if agent.active_id is None or agent.active_id not in agent.sessions:
+            raise KeyError(
+                f"No active RDP session for agent {agent.bearer!r}. "
+                "Call connect() first."
+            )
+        return agent.sessions[agent.active_id]
+
+    def active_id_of(self, bearer: Optional[str]) -> Optional[str]:
+        agent = self.agents.get(bearer or ANONYMOUS)
+        return agent.active_id if agent else None
 
     # -- session lifecycle --------------------------------------------------
 
     async def connect(
         self,
+        bearer: Optional[str],
         params: ConnectionParams,
         name: Optional[str] = None,
     ) -> str:
         from aardwolf.commons.factory import RDPConnectionFactory
         from aardwolf.commons.iosettings import RDPIOSettings
         from aardwolf.commons.queuedata.constants import VIDEO_FORMAT
+
+        agent = self._agent(bearer)
 
         iosettings = RDPIOSettings()
         iosettings.video_width = params.width
@@ -135,7 +171,7 @@ class SessionManager:
             f"{quote(user, safe='')}:{quote(params.password, safe='')}"
             f"@{params.host}:{params.port}"
         )
-        log.info("Connecting RDP %s as %s", params.host, user)
+        log.info("[%s] Connecting RDP %s as %s", agent.bearer, params.host, user)
 
         factory = RDPConnectionFactory.from_url(url, iosettings)
         conn = factory.get_connection(iosettings)
@@ -152,16 +188,15 @@ class SessionManager:
             conn=conn,
             connected_at=asyncio.get_event_loop().time(),
         )
-        self.sessions[sid] = session
-        # New session always becomes active.
-        self.active_id = sid
-        log.info("Connected session %s (%s) — now active", sid, session.name)
+        agent.sessions[sid] = session
+        agent.active_id = sid
+        log.info("[%s] Connected session %s (%s) — now active",
+                 agent.bearer, sid, session.name)
         return sid
 
-    async def disconnect(self) -> str:
-        """Close the active session. Next session in the dict (if any)
-        becomes the new active."""
-        session = self._active()
+    async def disconnect(self, bearer: Optional[str]) -> str:
+        agent = self._agent(bearer)
+        session = self._active(bearer)
         try:
             terminate = getattr(session.conn, "terminate", None)
             if terminate is None:
@@ -171,14 +206,18 @@ class SessionManager:
                 if asyncio.iscoroutine(res):
                     await res
         except Exception as exc:
-            log.warning("terminate failed for %s: %s", session.sid, exc)
-        self.sessions.pop(session.sid, None)
-        self.active_id = next(iter(self.sessions), None)
+            log.warning("[%s] terminate failed for %s: %s",
+                        agent.bearer, session.sid, exc)
+        agent.sessions.pop(session.sid, None)
+        agent.active_id = next(iter(agent.sessions), None)
         return session.sid
 
     # -- queries ------------------------------------------------------------
 
-    def list_sessions(self) -> list[dict]:
+    def list_sessions(self, bearer: Optional[str]) -> list[dict]:
+        agent = self.agents.get(bearer or ANONYMOUS)
+        if agent is None:
+            return []
         return [
             {
                 "session_id": s.sid,
@@ -187,23 +226,26 @@ class SessionManager:
                 "port": s.params.port,
                 "user": s.params.username,
                 "size": [s.params.width, s.params.height],
-                "active": s.sid == self.active_id,
+                "active": s.sid == agent.active_id,
             }
-            for s in self.sessions.values()
+            for s in agent.sessions.values()
         ]
 
-    def switch(self, sid: str) -> None:
-        if sid not in self.sessions:
-            raise KeyError(f"Unknown session: {sid}")
-        self.active_id = sid
+    def switch(self, bearer: Optional[str], sid: str) -> None:
+        agent = self._agent(bearer)
+        if sid not in agent.sessions:
+            raise KeyError(f"Unknown session for agent {agent.bearer!r}: {sid}")
+        agent.active_id = sid
 
-    # -- input/output (always operates on the active session) ---------------
+    # -- input/output (always operates on the agent's active session) -------
 
-    async def snapshot(self, wait_seconds: float = 5.0) -> bytes:
-        """PNG of the active desktop. Waits up to `wait_seconds` for the
-        first bitmap update to arrive."""
+    async def snapshot(
+        self,
+        bearer: Optional[str],
+        wait_seconds: float = 5.0,
+    ) -> bytes:
         from aardwolf.commons.queuedata.constants import VIDEO_FORMAT
-        session = self._active()
+        session = self._active(bearer)
         deadline = asyncio.get_event_loop().time() + wait_seconds
         while not getattr(session.conn, "desktop_buffer_has_data", False):
             if asyncio.get_event_loop().time() > deadline:
@@ -219,9 +261,9 @@ class SessionManager:
         img.save(buf, format="PNG")
         return buf.getvalue()
 
-    async def move_mouse(self, x: int, y: int) -> None:
+    async def move_mouse(self, bearer: Optional[str], x: int, y: int) -> None:
         from aardwolf.commons.queuedata.constants import MOUSEBUTTON
-        session = self._active()
+        session = self._active(bearer)
         session.last_x, session.last_y = int(x), int(y)
         await session.conn.send_mouse(
             MOUSEBUTTON.MOUSEBUTTON_HOVER, int(x), int(y), False,
@@ -229,13 +271,14 @@ class SessionManager:
 
     async def click_mouse(
         self,
+        bearer: Optional[str],
         button: str = "left",
         x: Optional[int] = None,
         y: Optional[int] = None,
         double: bool = False,
     ) -> None:
         from aardwolf.commons.queuedata.constants import MOUSEBUTTON
-        session = self._active()
+        session = self._active(bearer)
         btn_map = {
             "left":   MOUSEBUTTON.MOUSEBUTTON_LEFT,
             "right":  MOUSEBUTTON.MOUSEBUTTON_RIGHT,
@@ -245,7 +288,7 @@ class SessionManager:
             raise ValueError(f"button must be one of {list(btn_map)}")
         btn = btn_map[button]
         if x is not None and y is not None:
-            await self.move_mouse(x, y)
+            await self.move_mouse(bearer, x, y)
             await asyncio.sleep(0.03)
         cx = int(x) if x is not None else session.last_x
         cy = int(y) if y is not None else session.last_y
@@ -258,10 +301,11 @@ class SessionManager:
 
     async def keyboard(
         self,
+        bearer: Optional[str],
         text: Optional[str] = None,
         keys: Optional[list[str]] = None,
     ) -> None:
-        session = self._active()
+        session = self._active(bearer)
 
         if text:
             for ch in text:
@@ -273,7 +317,6 @@ class SessionManager:
         if not keys:
             return
 
-        # Treat `keys` as a chord: press all in order, release in reverse.
         resolved = [_resolve_key(k) for k in keys]
         for code, ext in resolved:
             await session.conn.send_key_scancode(code, True, ext)
@@ -281,15 +324,6 @@ class SessionManager:
         for code, ext in reversed(resolved):
             await session.conn.send_key_scancode(code, False, ext)
             await asyncio.sleep(0.01)
-
-    # -- internals ----------------------------------------------------------
-
-    def _active(self) -> RDPSession:
-        if self.active_id is None or self.active_id not in self.sessions:
-            raise KeyError(
-                "No active RDP session. Call connect() first."
-            )
-        return self.sessions[self.active_id]
 
 
 # Module-level singleton used by server.py
