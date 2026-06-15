@@ -20,6 +20,7 @@ import argparse
 import contextvars
 import logging
 import sys
+from pathlib import Path
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP, Image
@@ -104,9 +105,16 @@ async def switch(session_id: str) -> dict:
 
 
 @mcp.tool()
-async def snapshot() -> Image:
-    """Return a PNG screenshot of the calling agent's active session."""
+async def snapshot(path: Optional[str] = None) -> Image:
+    """Return a PNG screenshot of the calling agent's active session.
+
+    If `path` is provided, also save the PNG bytes to that local path.
+    """
     png = await session_manager.snapshot(_bearer())
+    if path:
+        output_path = Path(path).expanduser()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(png)
     return Image(data=png, format="png")
 
 

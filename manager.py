@@ -55,6 +55,7 @@ _SCANCODES: dict[str, int] = {
     "f11": 0x57, "f12": 0x58,
     "insert": 0xE052, "ins": 0xE052,
     "delete": 0xE053, "del": 0xE053,
+    "printscreen": 0xE037, "print_screen": 0xE037, "prtsc": 0xE037,
     "home": 0xE047,
     "end": 0xE04F,
     "pageup": 0xE049, "pgup": 0xE049,
